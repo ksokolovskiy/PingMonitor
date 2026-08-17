@@ -1,0 +1,15 @@
+# Local runtime data
+*.last.json
+*.log
+*.tmp
+*.bak
+
+# PowerShell/editor noise
+*.ps1xml
+.vscode/
+.idea/
+
+# OS files
+Thumbs.db
+Desktop.ini
+
