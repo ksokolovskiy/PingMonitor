@@ -2,6 +2,8 @@
 
 Small Windows 11 ping status widget written in PowerShell/WinForms.
 
+![PingMonitor widget screenshot](docs/screenshot.png)
+
 It stays on top as a compact desktop widget and shows:
 
 - target host
