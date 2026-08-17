@@ -33,3 +33,16 @@ Persistent statistics are stored locally under:
 ```
 
 Runtime data and diagnostics are intentionally not committed to this repository.
+
+
+## Install with WinGet
+
+After the package is accepted into the WinGet community repository:
+
+```powershell
+winget install ksokolovskiy.PingMonitor
+```
+
+Release builds are produced automatically from version tags such as `v1.0.0`.
+See [`winget/README.md`](winget/README.md) for publishing instructions.
+
