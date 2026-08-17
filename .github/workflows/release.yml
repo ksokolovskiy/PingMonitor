@@ -1,46 +1,189 @@
-name: Build and release
+name: Release and publish to WinGet
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - main
 
 permissions:
   contents: write
 
+concurrency:
+  group: pingmonitor-release
+  cancel-in-progress: false
+
 jobs:
-  build:
+  release:
     runs-on: windows-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Resolve version
+      - name: Calculate next version
         id: version
         shell: pwsh
         run: |
-          $version = '${{ github.ref_name }}'.TrimStart('v')
-          "version=$version" >> $env:GITHUB_OUTPUT
+          $ErrorActionPreference = 'Stop'
+
+          $tags = git tag --list 'v*' --sort=-version:refname
+          $latestTag = $tags | Select-Object -First 1
+
+          if (-not $latestTag) {
+              $major = 1
+              $minor = 0
+              $patch = 0
+          }
+          elseif ($latestTag -match '^v(\d+)\.(\d+)\.(\d+)$') {
+              $major = [int]$Matches[1]
+              $minor = [int]$Matches[2]
+              $patch = [int]$Matches[3] + 1
+          }
+          else {
+              throw "Latest tag '$latestTag' is not in vMAJOR.MINOR.PATCH format."
+          }
+
+          $releaseVersion = "$major.$minor.$patch"
+          $packageVersion = "$releaseVersion.0"
+          $tag = "v$releaseVersion"
+
+          "release_version=$releaseVersion" >> $env:GITHUB_OUTPUT
+          "package_version=$packageVersion" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+          Write-Host "Release version: $releaseVersion"
+          Write-Host "WinGet package version: $packageVersion"
+          Write-Host "Tag: $tag"
 
       - name: Build portable EXE
         shell: pwsh
-        run: ./build/build.ps1 -Version '${{ steps.version.outputs.version }}'
+        run: |
+          ./build/build.ps1 -Version '${{ steps.version.outputs.release_version }}'
 
-      - name: Generate WinGet manifests
+      - name: Smoke test build output
         shell: pwsh
         run: |
-          $version = '${{ steps.version.outputs.version }}'
           $exe = Join-Path $PWD 'dist\PingMonitor.exe'
-          $sha = (Get-FileHash -Algorithm SHA256 $exe).Hash
-          $url = "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/PingMonitor.exe"
-          ./build/New-WingetManifest.ps1 -Version $version -InstallerUrl $url -InstallerSha256 $sha
-          Compress-Archive -Path dist\winget\* -DestinationPath dist\winget-manifests.zip -Force
+          if (-not (Test-Path $exe)) {
+              throw "Build did not produce $exe"
+          }
+
+          $item = Get-Item $exe
+          if ($item.Length -lt 10KB) {
+              throw "Built executable looks unexpectedly small: $($item.Length) bytes"
+          }
+
+          $hash = (Get-FileHash -Algorithm SHA256 $exe).Hash
+          Write-Host "PingMonitor.exe SHA256: $hash"
+
+      - name: Create GitHub tag
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          $tag = '${{ steps.version.outputs.tag }}'
+          git tag $tag '${{ github.sha }}'
+          git push origin $tag
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          files: |
-            dist/PingMonitor.exe
-            dist/winget-manifests.zip
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ steps.version.outputs.tag }}'
+          gh release create $tag `
+            dist/PingMonitor.exe `
+            --repo '${{ github.repository }}' `
+            --target '${{ github.sha }}' `
+            --title $tag `
+            --generate-notes
+
+      - name: Wait for release asset
+        id: asset
+        shell: pwsh
+        run: |
+          $tag = '${{ steps.version.outputs.tag }}'
+          $url = "https://github.com/${{ github.repository }}/releases/download/$tag/PingMonitor.exe"
+
+          $ok = $false
+          for ($i = 1; $i -le 6; $i++) {
+              try {
+                  $response = Invoke-WebRequest -Uri $url -Method Head -MaximumRedirection 10 -UseBasicParsing
+                  if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 400) {
+                      $ok = $true
+                      break
+                  }
+              }
+              catch {
+                  Write-Host "Release asset not available yet (attempt $i/6)."
+              }
+
+              Start-Sleep -Seconds 10
+          }
+
+          if (-not $ok) {
+              throw "Release asset did not become available: $url"
+          }
+
+          "url=$url" >> $env:GITHUB_OUTPUT
+
+      - name: Check whether package already exists in WinGet
+        id: winget
+        shell: pwsh
+        run: |
+          $manifestApi = 'https://api.github.com/repos/microsoft/winget-pkgs/contents/manifests/k/KostyaSokolovskiy/PingMonitor'
+
+          try {
+              $response = Invoke-WebRequest `
+                -Uri $manifestApi `
+                -Headers @{ 'User-Agent' = 'PingMonitor-GitHub-Actions' } `
+                -UseBasicParsing
+
+              if ($response.StatusCode -eq 200) {
+                  "exists=true" >> $env:GITHUB_OUTPUT
+                  Write-Host 'Package exists in WinGet. Update will be submitted.'
+              }
+              else {
+                  "exists=false" >> $env:GITHUB_OUTPUT
+              }
+          }
+          catch {
+              if ($_.Exception.Response.StatusCode.value__ -eq 404) {
+                  "exists=false" >> $env:GITHUB_OUTPUT
+                  Write-Host 'Package is not in WinGet yet. Skipping automatic submission for this release.'
+              }
+              else {
+                  throw
+              }
+          }
+
+      - name: Download WingetCreate
+        if: steps.winget.outputs.exists == 'true'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest `
+            -Uri 'https://aka.ms/wingetcreate/latest' `
+            -OutFile 'wingetcreate.exe' `
+            -UseBasicParsing
+
+      - name: Submit WinGet update
+        if: steps.winget.outputs.exists == 'true'
+        shell: pwsh
+        env:
+          WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_GITHUB_TOKEN }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINGET_CREATE_GITHUB_TOKEN)) {
+              throw 'Repository secret WINGET_GITHUB_TOKEN is not configured.'
+          }
+
+          $url = '${{ steps.asset.outputs.url }}'
+          $packageVersion = '${{ steps.version.outputs.package_version }}'
+
+          .\wingetcreate.exe update KostyaSokolovskiy.PingMonitor `
+            -u $url `
+            -v $packageVersion `
+            -t $env:WINGET_CREATE_GITHUB_TOKEN `
+            --submit
