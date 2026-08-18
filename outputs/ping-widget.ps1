@@ -2,7 +2,8 @@ param(
     [string]$Target = '8.8.8.8',
     [int]$IntervalSeconds = 1,
     [int]$HistorySeconds = 60,
-    [int]$TimeoutMs = 1000
+    [int]$TimeoutMs = 1000,
+    [switch]$DebugDiagnostics
 )
 
 Set-StrictMode -Version Latest
@@ -10,15 +11,28 @@ $ErrorActionPreference = 'Stop'
 
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 
+try {
+    [System.Diagnostics.Process]::GetCurrentProcess().PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal
+}
+catch {
+}
+
 $IntervalSeconds = [Math]::Max(1, $IntervalSeconds)
 $HistorySeconds = [Math]::Max(60, $HistorySeconds)
 $TimeoutMs = [Math]::Max(50, $TimeoutMs)
 
 $script:state = $null
 $script:ping = New-Object System.Net.NetworkInformation.Ping
+$script:pingTask = $null
+$script:lastPingStartedAt = [DateTime]::MinValue
 $script:saveCounter = 0
+$script:pruneCounter = 0
 $script:expanded = $false
 $script:lastStats = @{}
+$script:rolling = @{}
+$script:rollingDayStart = 0L
+$script:renderCache = @{}
+$script:tooltipCounter = 0
 $script:draggingControl = $false
 $script:dragStartMouse = [System.Drawing.Point]::Empty
 $script:dragStartForm = [System.Drawing.Point]::Empty
@@ -71,7 +85,7 @@ function New-State {
         consecutiveLosses = 0
         lastPingMs        = 0.0
         lastOk            = $false
-        events            = @()
+        events            = (New-Object System.Collections.ArrayList)
     }
 }
 
@@ -99,7 +113,7 @@ function Load-State {
                     latency = To-Double $e.latency
                 })
             }
-            $loaded.events = @($items)
+            $loaded.events = $items
         }
 
         $loaded.all_sent = [int64]$loaded.all_sent
@@ -179,6 +193,146 @@ function Get-AllTimeStats {
     }
 }
 
+function New-RollingBucket {
+    [pscustomobject]@{
+        Events = (New-Object System.Collections.ArrayList)
+        Sent   = 0
+        Recv   = 0
+        Lost   = 0
+        Loss   = 0.0
+        Min    = 0.0
+        Avg    = 0.0
+        Max    = 0.0
+        Sum    = 0.0
+    }
+}
+
+function Add-ToRollingBucket {
+    param([pscustomobject]$Bucket, [pscustomobject]$Event)
+
+    $null = $Bucket.Events.Add($Event)
+    $Bucket.Sent++
+    if ([bool]$Event.ok) {
+        $Bucket.Recv++
+        $lat = To-Double $Event.latency
+        $Bucket.Sum += $lat
+        if ($Bucket.Min -eq 0 -or $lat -lt $Bucket.Min) { $Bucket.Min = $lat }
+        if ($lat -gt $Bucket.Max) { $Bucket.Max = $lat }
+    }
+}
+
+function Recalc-RollingBucket {
+    param([pscustomobject]$Bucket)
+
+    $Bucket.Sent = 0
+    $Bucket.Recv = 0
+    $Bucket.Lost = 0
+    $Bucket.Loss = 0.0
+    $Bucket.Min = 0.0
+    $Bucket.Avg = 0.0
+    $Bucket.Max = 0.0
+    $Bucket.Sum = 0.0
+
+    foreach ($event in $Bucket.Events) {
+        $Bucket.Sent++
+        if ([bool]$event.ok) {
+            $Bucket.Recv++
+            $lat = To-Double $event.latency
+            $Bucket.Sum += $lat
+            if ($Bucket.Min -eq 0 -or $lat -lt $Bucket.Min) { $Bucket.Min = $lat }
+            if ($lat -gt $Bucket.Max) { $Bucket.Max = $lat }
+        }
+    }
+}
+
+function Prune-RollingBucket {
+    param([pscustomobject]$Bucket, [int64]$FromTs)
+
+    $removedAffectsMinMax = $false
+    while ($Bucket.Events.Count -gt 0 -and [int64]$Bucket.Events[0].ts -lt $FromTs) {
+        $event = $Bucket.Events[0]
+        $Bucket.Events.RemoveAt(0)
+        $Bucket.Sent--
+        if ([bool]$event.ok) {
+            $Bucket.Recv--
+            $lat = To-Double $event.latency
+            $Bucket.Sum -= $lat
+            if ($lat -eq $Bucket.Min -or $lat -eq $Bucket.Max) { $removedAffectsMinMax = $true }
+        }
+    }
+
+    if ($removedAffectsMinMax) {
+        Recalc-RollingBucket -Bucket $Bucket
+    }
+}
+
+function Snapshot-RollingBucket {
+    param([pscustomobject]$Bucket)
+
+    $lost = $Bucket.Sent - $Bucket.Recv
+    [pscustomobject]@{
+        Sent = $Bucket.Sent
+        Recv = $Bucket.Recv
+        Lost = $lost
+        Loss = if ($Bucket.Sent -gt 0) { 100.0 * $lost / $Bucket.Sent } else { 0.0 }
+        Min  = $Bucket.Min
+        Avg  = if ($Bucket.Recv -gt 0) { $Bucket.Sum / $Bucket.Recv } else { 0.0 }
+        Max  = $Bucket.Max
+    }
+}
+
+function Rebuild-RollingBuckets {
+    param([array]$Events)
+
+    $script:rollingDayStart = Get-DayStartTs
+    $script:rolling = @{
+        '1m'    = New-RollingBucket
+        '1h'    = New-RollingBucket
+        'Today' = New-RollingBucket
+    }
+
+    $now = Get-UnixNow
+    $from1m = $now - 60
+    $from1h = $now - 3600
+
+    foreach ($event in @($Events)) {
+        $ts = [int64]$event.ts
+        if ($ts -ge $from1m) { Add-ToRollingBucket -Bucket $script:rolling['1m'] -Event $event }
+        if ($ts -ge $from1h) { Add-ToRollingBucket -Bucket $script:rolling['1h'] -Event $event }
+        if ($ts -ge $script:rollingDayStart) { Add-ToRollingBucket -Bucket $script:rolling['Today'] -Event $event }
+    }
+}
+
+function Add-ToRollingBuckets {
+    param([pscustomobject]$Event)
+
+    Add-ToRollingBucket -Bucket $script:rolling['1m'] -Event $Event
+    Add-ToRollingBucket -Bucket $script:rolling['1h'] -Event $Event
+    Add-ToRollingBucket -Bucket $script:rolling['Today'] -Event $Event
+}
+
+function Get-StatsSnapshot {
+    param([pscustomobject]$State)
+
+    $now = Get-UnixNow
+    $dayStart = Get-DayStartTs
+
+    if ($dayStart -ne $script:rollingDayStart) {
+        Rebuild-RollingBuckets -Events $State.events
+    }
+
+    Prune-RollingBucket -Bucket $script:rolling['1m'] -FromTs ($now - 60)
+    Prune-RollingBucket -Bucket $script:rolling['1h'] -FromTs ($now - 3600)
+    Prune-RollingBucket -Bucket $script:rolling['Today'] -FromTs $dayStart
+
+    return @{
+        '1m'    = Snapshot-RollingBucket -Bucket $script:rolling['1m']
+        '1h'    = Snapshot-RollingBucket -Bucket $script:rolling['1h']
+        'Today' = Snapshot-RollingBucket -Bucket $script:rolling['Today']
+        'All'   = Get-AllTimeStats -State $State
+    }
+}
+
 function Get-LossColor {
     param([double]$Loss)
 
@@ -215,6 +369,32 @@ function Format-Tooltip {
 
     return ("{0}`r`n`r`nSent: {1}`r`nReceived: {2}`r`nLost: {3}`r`nLoss: {4:N2}%`r`n`r`nPing:`r`nMin: {5:N0} ms`r`nAvg: {6:N0} ms`r`nMax: {7:N0} ms" -f `
         $Title, $Stats.Sent, $Stats.Recv, $Stats.Lost, [double]$Stats.Loss, [double]$Stats.Min, [double]$Stats.Avg, [double]$Stats.Max)
+}
+
+function Set-CachedText {
+    param([string]$Key, [System.Windows.Forms.Control]$Control, [string]$Text)
+    if (-not $script:renderCache.ContainsKey($Key) -or $script:renderCache[$Key] -ne $Text) {
+        $Control.Text = $Text
+        $script:renderCache[$Key] = $Text
+    }
+}
+
+function Set-CachedForeColor {
+    param([string]$Key, [System.Windows.Forms.Control]$Control, [System.Drawing.Color]$Color)
+    $value = $Color.ToArgb()
+    if (-not $script:renderCache.ContainsKey($Key) -or $script:renderCache[$Key] -ne $value) {
+        $Control.ForeColor = $Color
+        $script:renderCache[$Key] = $value
+    }
+}
+
+function Set-CachedBackColor {
+    param([string]$Key, [System.Windows.Forms.Control]$Control, [System.Drawing.Color]$Color)
+    $value = $Color.ToArgb()
+    if (-not $script:renderCache.ContainsKey($Key) -or $script:renderCache[$Key] -ne $value) {
+        $Control.BackColor = $Color
+        $script:renderCache[$Key] = $value
+    }
 }
 
 function New-Label {
@@ -268,9 +448,10 @@ function Add-DragMove {
 
 $stateDir = Join-Path $env:LOCALAPPDATA 'PingMonitor'
 $stateFile = Join-Path $stateDir ("ping-stats-$($Target -replace '[:\\/]', '_').json")
-$debugFile = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'ping-widget.last.json'
+$debugFile = if ($DebugDiagnostics) { Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'ping-widget.last.json' } else { $null }
 $script:state = Load-State -Path $stateFile -Fallback (New-State -TargetName $Target)
 $script:state.target = $Target
+Rebuild-RollingBuckets -Events $script:state.events
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text = 'Ping Widget'
@@ -417,44 +598,46 @@ function Set-Expanded {
 }
 
 function Update-Ui {
-    $now = Get-UnixNow
-    $script:lastStats = @{
-        '1m'    = Get-RangeStats -FromTs ($now - 60) -Events $script:state.events
-        '1h'    = Get-RangeStats -FromTs ($now - 3600) -Events $script:state.events
-        'Today' = Get-RangeStats -FromTs (Get-DayStartTs) -Events $script:state.events
-        'All'   = Get-AllTimeStats -State $script:state
-    }
+    $script:lastStats = Get-StatsSnapshot -State $script:state
+    $script:tooltipCounter++
+    $updateTooltips = $script:tooltipCounter -ge 5
+    if ($updateTooltips) { $script:tooltipCounter = 0 }
 
     $stats1m = $script:lastStats['1m']
     $statusColor = Get-StatusColor -Stats1m $stats1m
     $statusText = Get-StatusText -Stats1m $stats1m
 
-    $dotLabel.ForeColor = $statusColor
-    $hostLabel.Text = $script:state.target
-    $statusLabel.Text = $statusText
-    $statusLabel.ForeColor = $statusColor
-    $latencyLabel.Text = Format-Latency
-    $latencyLabel.ForeColor = if ($script:state.lastOk) { $colors.Text } else { $colors.Red }
-    $timeLabel.Text = Get-Date -Format 'HH:mm:ss'
+    Set-CachedForeColor -Key 'dot.fore' -Control $dotLabel -Color $statusColor
+    Set-CachedText -Key 'host.text' -Control $hostLabel -Text $script:state.target
+    Set-CachedText -Key 'status.text' -Control $statusLabel -Text $statusText
+    Set-CachedForeColor -Key 'status.fore' -Control $statusLabel -Color $statusColor
+    Set-CachedText -Key 'latency.text' -Control $latencyLabel -Text (Format-Latency)
+    Set-CachedForeColor -Key 'latency.fore' -Control $latencyLabel -Color $(if ($script:state.lastOk) { $colors.Text } else { $colors.Red })
+    Set-CachedText -Key 'time.text' -Control $timeLabel -Text (Get-Date -Format 'HH:mm:ss')
 
     foreach ($key in @('1m','1h','Today','All')) {
         $stats = $script:lastStats[$key]
         $lossColor = Get-LossColor -Loss ([double]$stats.Loss)
         $label = $periodLabels[$key]
-        $label.Text = ('{0}  {1:N1}%' -f $key, [double]$stats.Loss)
-        $label.ForeColor = $colors.Text
-        $label.BackColor = [System.Drawing.Color]::FromArgb(44, $lossColor.R, $lossColor.G, $lossColor.B)
-        $tooltip.SetToolTip($label, (Format-Tooltip -Title $key -Stats $stats))
+        Set-CachedText -Key "$key.label.text" -Control $label -Text ('{0}  {1:N1}%' -f $key, [double]$stats.Loss)
+        Set-CachedForeColor -Key "$key.label.fore" -Control $label -Color $colors.Text
+        Set-CachedBackColor -Key "$key.label.back" -Control $label -Color ([System.Drawing.Color]::FromArgb(44, $lossColor.R, $lossColor.G, $lossColor.B))
+        if ($updateTooltips) {
+            $tooltip.SetToolTip($label, (Format-Tooltip -Title $key -Stats $stats))
+        }
 
-        $detailCells["$key.LOSS"].Text = ('{0:N1}%' -f [double]$stats.Loss)
-        $detailCells["$key.LOSS"].ForeColor = $lossColor
-        $detailCells["$key.SENT"].Text = [string]$stats.Sent
-        $detailCells["$key.LOST"].Text = [string]$stats.Lost
-        $detailCells["$key.AVG"].Text = if ($stats.Recv -gt 0) { ('{0:N0}' -f [double]$stats.Avg) } else { '--' }
+        Set-CachedText -Key "$key.detail.loss.text" -Control $detailCells["$key.LOSS"] -Text ('{0:N1}%' -f [double]$stats.Loss)
+        Set-CachedForeColor -Key "$key.detail.loss.fore" -Control $detailCells["$key.LOSS"] -Color $lossColor
+        Set-CachedText -Key "$key.detail.sent.text" -Control $detailCells["$key.SENT"] -Text ([string]$stats.Sent)
+        Set-CachedText -Key "$key.detail.lost.text" -Control $detailCells["$key.LOST"] -Text ([string]$stats.Lost)
+        Set-CachedText -Key "$key.detail.avg.text" -Control $detailCells["$key.AVG"] -Text $(if ($stats.Recv -gt 0) { ('{0:N0}' -f [double]$stats.Avg) } else { '--' })
     }
 
-    $tooltip.SetToolTip($top, ("{0}`r`nSent: {1}`r`nReceived: {2}`r`nLost: {3}" -f $script:state.target, $script:state.all_sent, $script:state.all_recv, ($script:state.all_sent - $script:state.all_recv)))
+    if ($updateTooltips) {
+        $tooltip.SetToolTip($top, ("{0}`r`nSent: {1}`r`nReceived: {2}`r`nLost: {3}" -f $script:state.target, $script:state.all_sent, $script:state.all_recv, ($script:state.all_sent - $script:state.all_recv)))
+    }
 
+    if ($DebugDiagnostics) {
     try {
         [pscustomobject]@{
             updatedAt = (Get-Date).ToString('s')
@@ -472,6 +655,7 @@ function Update-Ui {
         } | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $debugFile -Encoding UTF8
     }
     catch {
+    }
     }
 }
 
@@ -500,31 +684,72 @@ function Add-Sample {
         $script:state.lastOk = $false
     }
 
-    $script:state.events = @($script:state.events + $evt | Where-Object { [int64]$_.ts -ge ($ts - 86400) })
+    $null = $script:state.events.Add($evt)
+    Add-ToRollingBuckets -Event $evt
+
+    $script:pruneCounter++
+    if ($script:pruneCounter -ge 60) {
+        $cutoff = $ts - 86400
+        while ($script:state.events.Count -gt 0 -and [int64]$script:state.events[0].ts -lt $cutoff) {
+            $script:state.events.RemoveAt(0)
+        }
+        $script:pruneCounter = 0
+    }
 }
 
-function Run-PingCycle {
+function Complete-PingTask {
+    if ($null -eq $script:pingTask -or -not $script:pingTask.IsCompleted) { return }
+
     $ok = $false
     $latency = 0.0
 
     try {
-        $reply = $script:ping.Send($script:state.target, $TimeoutMs)
-        if ($reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {
-            $ok = $true
-            $latency = [double]$reply.RoundtripTime
+        if (-not $script:pingTask.IsFaulted -and -not $script:pingTask.IsCanceled) {
+            $reply = $script:pingTask.Result
+            if ($reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {
+                $ok = $true
+                $latency = [double]$reply.RoundtripTime
+            }
         }
     }
     catch {
         $ok = $false
     }
+    finally {
+        $script:pingTask = $null
+    }
 
     Add-Sample -Ok $ok -Latency $latency
+
     $script:saveCounter++
-    if ($script:saveCounter -ge 5) {
+    if ($script:saveCounter -ge 300) {
         Save-State -State $script:state -Path $stateFile
         $script:saveCounter = 0
     }
+
     Update-Ui
+}
+
+function Start-PingTaskIfDue {
+    if ($null -ne $script:pingTask) { return }
+
+    $now = [DateTime]::UtcNow
+    if (($now - $script:lastPingStartedAt).TotalMilliseconds -lt ($IntervalSeconds * 1000)) { return }
+
+    $script:lastPingStartedAt = $now
+    try {
+        $script:pingTask = $script:ping.SendPingAsync($script:state.target, $TimeoutMs)
+    }
+    catch {
+        $script:pingTask = $null
+        Add-Sample -Ok $false -Latency 0.0
+        Update-Ui
+    }
+}
+
+function Poll-Ping {
+    Complete-PingTask
+    Start-PingTaskIfDue
 }
 
 $toggleButton.Add_Click({ Set-Expanded -Value (-not $script:expanded) })
@@ -534,19 +759,20 @@ foreach ($control in @($top, $periods, $hostLabel, $statusLabel, $latencyLabel, 
     Add-DragMove -Control $control -Form $form
 }
 
-$timer = New-Object System.Windows.Forms.Timer
-$timer.Interval = [int]($IntervalSeconds * 1000)
-$timer.Add_Tick({ Run-PingCycle })
+$uiTimer = New-Object System.Windows.Forms.Timer
+$uiTimer.Interval = 1000
+$uiTimer.Add_Tick({ Poll-Ping })
 
 $form.Add_Shown({
     Update-Ui
-    Run-PingCycle
-    $timer.Start()
+    $script:lastPingStartedAt = [DateTime]::MinValue
+    Poll-Ping
+    $uiTimer.Start()
 })
 
 $form.Add_FormClosing({
-    $timer.Stop()
-    $timer.Dispose()
+    $uiTimer.Stop()
+    $uiTimer.Dispose()
     Save-State -State $script:state -Path $stateFile
     if ($null -ne $script:ping) { $script:ping.Dispose() }
 })
