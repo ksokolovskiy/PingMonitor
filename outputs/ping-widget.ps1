@@ -3,6 +3,9 @@ param(
     [int]$IntervalSeconds = 1,
     [int]$HistorySeconds = 60,
     [int]$TimeoutMs = 1000,
+    [Alias('Opacity')]
+    [double]$IdleOpacity = 0.0,
+    [double]$HoverOpacity = 0.0,
     [switch]$DebugDiagnostics
 )
 
@@ -92,9 +95,9 @@ function New-State {
 function Load-State {
     param([string]$Path, [pscustomobject]$Fallback)
 
-    if (-not (Test-Path -LiteralPath $Path)) { return $Fallback }
-
     try {
+        if (-not (Test-Path -LiteralPath $Path -ErrorAction SilentlyContinue)) { return $Fallback }
+
         $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
         if (-not $raw) { return $Fallback }
 
@@ -136,10 +139,66 @@ function Save-State {
 
     try {
         $dir = Split-Path -Parent $Path
-        if (-not (Test-Path -LiteralPath $dir)) {
+        if (-not (Test-Path -LiteralPath $dir -ErrorAction SilentlyContinue)) {
             New-Item -ItemType Directory -Path $dir -Force | Out-Null
         }
         $State | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Path -Encoding UTF8 -ErrorAction Stop
+    }
+    catch {
+    }
+}
+
+function Load-Settings {
+    param([string]$Path)
+
+    $defaults = [pscustomobject]@{
+        settingsVersion = 2
+        idleOpacity  = 0.35
+        hoverOpacity = 1.0
+    }
+
+    try {
+        if (-not (Test-Path -LiteralPath $Path -ErrorAction SilentlyContinue)) { return $defaults }
+        $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        if ($null -ne $raw) {
+            # Version 1 was written while the menu callback could save the hover
+            # opacity as the idle value.  Only migrate that old, ambiguous value;
+            # a value of 1.0 is a valid choice in the current format.
+            $isLegacySettings = -not $raw.PSObject.Properties['settingsVersion']
+            if ($raw.PSObject.Properties['idleOpacity']) {
+                $val = [double]$raw.idleOpacity
+                if ($val -gt 1.0 -and $val -le 100.0) { $val = $val / 100.0 }
+                if ($val -ge 0.05 -and $val -le 1.0) {
+                    if ($isLegacySettings -and [Math]::Abs($val - 1.0) -lt 0.01) {
+                        $defaults.idleOpacity = 0.35
+                    }
+                    else {
+                        $defaults.idleOpacity = $val
+                    }
+                }
+            }
+            if ($raw.PSObject.Properties['hoverOpacity']) {
+                $val = [double]$raw.hoverOpacity
+                if ($val -gt 1.0 -and $val -le 100.0) { $val = $val / 100.0 }
+                if ($val -ge 0.1 -and $val -le 1.0) { $defaults.hoverOpacity = $val }
+            }
+        }
+        return $defaults
+    }
+    catch {
+        return $defaults
+    }
+}
+
+function Save-Settings {
+    param([pscustomobject]$Settings, [string]$Path)
+
+    try {
+        $dir = Split-Path -Parent $Path
+        if (-not (Test-Path -LiteralPath $dir -ErrorAction SilentlyContinue)) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        }
+        $Settings | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $Path -Encoding UTF8 -ErrorAction Stop
     }
     catch {
     }
@@ -433,6 +492,9 @@ function Add-DragMove {
         $script:draggingControl = $true
         $script:dragStartMouse = [System.Windows.Forms.Cursor]::Position
         $script:dragStartForm = $Form.Location
+        if ($Form.Opacity -ne $script:hoverOpacity) {
+            $Form.Opacity = $script:hoverOpacity
+        }
     })
 
     $Control.Add_MouseMove({
@@ -443,12 +505,47 @@ function Add-DragMove {
         $Form.Location = New-Object System.Drawing.Point(($script:dragStartForm.X + $dx), ($script:dragStartForm.Y + $dy))
     })
 
-    $Control.Add_MouseUp({ $script:draggingControl = $false })
+    $Control.Add_MouseUp({
+        $script:draggingControl = $false
+        if (-not $Form.Bounds.Contains([System.Windows.Forms.Cursor]::Position) -and -not $menu.Visible) {
+            if ($Form.Opacity -ne $script:idleOpacity) {
+                $Form.Opacity = $script:idleOpacity
+            }
+            if ($hoverTimer.Enabled) {
+                $hoverTimer.Stop()
+            }
+        }
+    })
 }
 
 $stateDir = Join-Path $env:LOCALAPPDATA 'PingMonitor'
 $stateFile = Join-Path $stateDir ("ping-stats-$($Target -replace '[:\\/]', '_').json")
+$settingsFile = Join-Path $stateDir 'settings.json'
 $debugFile = if ($DebugDiagnostics) { Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'ping-widget.last.json' } else { $null }
+
+$script:settings = Load-Settings -Path $settingsFile
+# Persist the format marker after a legacy migration.  This makes an explicitly
+# selected 0% transparency (opacity 1.0) stable on all subsequent launches.
+Save-Settings -Settings $script:settings -Path $settingsFile
+
+if ($PSBoundParameters.ContainsKey('IdleOpacity') -and $IdleOpacity -gt 0) {
+    $norm = [double]$IdleOpacity
+    if ($norm -gt 1.0 -and $norm -le 100.0) { $norm = $norm / 100.0 }
+    $script:idleOpacity = [Math]::Min(1.0, [Math]::Max(0.05, $norm))
+}
+else {
+    $script:idleOpacity = [double]$script:settings.idleOpacity
+}
+
+if ($PSBoundParameters.ContainsKey('HoverOpacity') -and $HoverOpacity -gt 0) {
+    $norm = [double]$HoverOpacity
+    if ($norm -gt 1.0 -and $norm -le 100.0) { $norm = $norm / 100.0 }
+    $script:hoverOpacity = [Math]::Min(1.0, [Math]::Max(0.1, $norm))
+}
+else {
+    $script:hoverOpacity = [double]$script:settings.hoverOpacity
+}
+
 $script:state = Load-State -Path $stateFile -Fallback (New-State -TargetName $Target)
 $script:state.target = $Target
 Rebuild-RollingBuckets -Events $script:state.events
@@ -460,14 +557,111 @@ $form.MinimumSize = New-Object System.Drawing.Size(420, 108)
 $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
 $form.BackColor = $colors.Back
 $form.ForeColor = $colors.Text
+$form.Opacity = $script:idleOpacity
 $form.TopMost = $true
 $form.ShowInTaskbar = $false
 $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::SizableToolWindow
 
+$hoverTimer = New-Object System.Windows.Forms.Timer
+$hoverTimer.Interval = 100
+$hoverTimer.Add_Tick({
+    if ([System.Windows.Forms.Control]::MouseButtons -eq [System.Windows.Forms.MouseButtons]::None) {
+        $script:draggingControl = $false
+    }
+    if (-not $script:draggingControl -and -not $menu.Visible) {
+        if (-not $form.Bounds.Contains([System.Windows.Forms.Cursor]::Position)) {
+            if ($form.Opacity -ne $script:idleOpacity) {
+                $form.Opacity = $script:idleOpacity
+            }
+            $hoverTimer.Stop()
+        }
+    }
+})
+
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
+$menu.BackColor = $colors.Panel
+$menu.ForeColor = $colors.Text
+
+$headerItem = New-Object System.Windows.Forms.ToolStripMenuItem("Target: $Target")
+$headerItem.Enabled = $false
+$headerItem.ForeColor = $colors.Muted
+$null = $menu.Items.Add($headerItem)
+
+$null = $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+
+$transMenu = New-Object System.Windows.Forms.ToolStripMenuItem('Transparency')
+$transMenu.BackColor = $colors.Panel
+$transMenu.ForeColor = $colors.Text
+$transMenu.DropDown.BackColor = $colors.Panel
+$transMenu.DropDown.ForeColor = $colors.Text
+$transMenu.DropDown.ShowCheckMargin = $true
+$transMenu.DropDown.ShowImageMargin = $false
+
+$script:opacityMenuItems = @()
+$opacityPresets = @(
+    [pscustomobject]@{ Text = '85% (Very transparent)'; Value = 0.15 },
+    [pscustomobject]@{ Text = '75% (Transparent)';      Value = 0.25 },
+    [pscustomobject]@{ Text = '65% (Default)';          Value = 0.35 },
+    [pscustomobject]@{ Text = '50% (Medium)';           Value = 0.50 },
+    [pscustomobject]@{ Text = '30% (Low)';              Value = 0.70 },
+    [pscustomobject]@{ Text = '0% (Opaque)';            Value = 1.00 }
+)
+
+function Set-IdleOpacity {
+    param([double]$NewOpacity)
+
+    $script:idleOpacity = $NewOpacity
+    $script:settings.idleOpacity = $NewOpacity
+    Save-Settings -Settings $script:settings -Path $settingsFile
+
+    foreach ($mItem in $script:opacityMenuItems) {
+        $mItem.Checked = ([Math]::Abs([double]$mItem.Tag - $NewOpacity) -lt 0.05)
+    }
+
+    if (-not $form.Bounds.Contains([System.Windows.Forms.Cursor]::Position)) {
+        $form.Opacity = $script:idleOpacity
+    }
+}
+
+foreach ($preset in $opacityPresets) {
+    $item = New-Object System.Windows.Forms.ToolStripMenuItem($preset.Text)
+    $item.Tag = [double]$preset.Value
+    $item.BackColor = $colors.Panel
+    $item.ForeColor = $colors.Text
+    $item.Checked = ([Math]::Abs($preset.Value - $script:idleOpacity) -lt 0.05)
+    $item.Add_Click({
+        param($sender, $e)
+        Set-IdleOpacity -NewOpacity ([double]$sender.Tag)
+    })
+    $script:opacityMenuItems += $item
+    $null = $transMenu.DropDownItems.Add($item)
+}
+$null = $menu.Items.Add($transMenu)
+
+$null = $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+
 $exitItem = New-Object System.Windows.Forms.ToolStripMenuItem('Exit')
+$exitItem.BackColor = $colors.Panel
+$exitItem.ForeColor = $colors.Text
 $exitItem.Add_Click({ $form.Close() })
 $null = $menu.Items.Add($exitItem)
+
+$menu.Add_Closed({
+    if ([System.Windows.Forms.Control]::MouseButtons -eq [System.Windows.Forms.MouseButtons]::None) {
+        $script:draggingControl = $false
+    }
+    if (-not $script:draggingControl) {
+        if (-not $form.Bounds.Contains([System.Windows.Forms.Cursor]::Position)) {
+            if ($form.Opacity -ne $script:idleOpacity) {
+                $form.Opacity = $script:idleOpacity
+            }
+            if ($hoverTimer.Enabled) {
+                $hoverTimer.Stop()
+            }
+        }
+    }
+})
+
 $form.ContextMenuStrip = $menu
 
 $tooltip = New-Object System.Windows.Forms.ToolTip
@@ -752,18 +946,64 @@ function Poll-Ping {
     Start-PingTaskIfDue
 }
 
+function Register-HoverEvents {
+    param([System.Windows.Forms.Control]$Control)
+
+    if ($null -eq $Control.ContextMenuStrip) {
+        $Control.ContextMenuStrip = $menu
+    }
+
+    $Control.Add_MouseEnter({
+        if ($form.Opacity -ne $script:hoverOpacity) {
+            $form.Opacity = $script:hoverOpacity
+        }
+        if (-not $hoverTimer.Enabled) {
+            $hoverTimer.Start()
+        }
+    })
+
+    $Control.Add_MouseLeave({
+        if (-not $script:draggingControl -and -not $menu.Visible) {
+            if (-not $form.Bounds.Contains([System.Windows.Forms.Cursor]::Position)) {
+                if ($form.Opacity -ne $script:idleOpacity) {
+                    $form.Opacity = $script:idleOpacity
+                }
+                $hoverTimer.Stop()
+            }
+        }
+    })
+
+    foreach ($child in $Control.Controls) {
+        Register-HoverEvents -Control $child
+    }
+}
+
+Register-HoverEvents -Control $form
+
 $toggleButton.Add_Click({ Set-Expanded -Value (-not $script:expanded) })
 $form.Add_DoubleClick({ Set-Expanded -Value (-not $script:expanded) })
 $root.Add_DoubleClick({ Set-Expanded -Value (-not $script:expanded) })
-foreach ($control in @($top, $periods, $hostLabel, $statusLabel, $latencyLabel, $timeLabel)) {
+foreach ($control in @($root, $top, $periods, $hostLabel, $statusLabel, $latencyLabel, $timeLabel)) {
     Add-DragMove -Control $control -Form $form
 }
 
 $uiTimer = New-Object System.Windows.Forms.Timer
 $uiTimer.Interval = 1000
-$uiTimer.Add_Tick({ Poll-Ping })
+$uiTimer.Add_Tick({
+    Poll-Ping
+    if (-not $script:draggingControl -and -not $menu.Visible) {
+        $isHovered = $form.Bounds.Contains([System.Windows.Forms.Cursor]::Position)
+        $targetOpacity = if ($isHovered) { $script:hoverOpacity } else { $script:idleOpacity }
+        if ($form.Opacity -ne $targetOpacity) {
+            $form.Opacity = $targetOpacity
+        }
+    }
+})
 
 $form.Add_Shown({
+    $isHovered = $form.Bounds.Contains([System.Windows.Forms.Cursor]::Position)
+    $form.Opacity = if ($isHovered) { $script:hoverOpacity } else { $script:idleOpacity }
+    if ($isHovered) { $hoverTimer.Start() }
     Update-Ui
     $script:lastPingStartedAt = [DateTime]::MinValue
     Poll-Ping
@@ -771,6 +1011,8 @@ $form.Add_Shown({
 })
 
 $form.Add_FormClosing({
+    $hoverTimer.Stop()
+    $hoverTimer.Dispose()
     $uiTimer.Stop()
     $uiTimer.Dispose()
     Save-State -State $script:state -Path $stateFile
